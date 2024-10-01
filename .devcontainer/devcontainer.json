@@ -1,0 +1,31 @@
+{
+    "name": "Sheeps toolkit developer",
+    "image": "renatomoitinho/dev-container:go-23.1",
+    "forwardPorts": [],
+    "remoteUser": "developer",
+    "containerEnv": {
+        "GOPATH": "/home/developer/go"
+    },
+    "remoteEnv": {},
+    "runArgs": [
+        "--privileged",
+        "--network=host"
+    ],
+    "mounts": [
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+    ],
+    "postCreateCommand": "go mod download && go mod tidy",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "go.useLanguageServer": true
+            },
+            "extensions": [
+                "golang.go",
+                "ms-vscode.go",
+                "ms-vscode.makefile-tools",
+                "EditorConfig.EditorConfig"
+            ]
+        }
+    }
+}
