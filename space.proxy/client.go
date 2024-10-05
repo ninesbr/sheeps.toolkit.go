@@ -13,19 +13,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-type UploadRequest struct {
-	Key         string
-	ContentType string
-	Extension   string
-	Size        int64
-}
-
-type UploadResponse struct {
-	*pb.PushRes
-}
-
 type SpaceInterface interface {
 	Upload(ctx context.Context, info *UploadRequest, buf *bufio.Reader) (*UploadResponse, error)
+	CopyFrom(ctx context.Context, req *CopyRequest) (*CopyResponse, error)
+	Drop(ctx context.Context, key string) error
 	Close() error
 }
 
@@ -36,8 +27,8 @@ type space struct {
 }
 
 func New(ops *options) SpaceInterface {
-	if errs, ok := ops.Validate(); !ok {
-		panic(errs)
+	if err := ops.Validate(); err != nil {
+		panic(err)
 	}
 
 	var opts []grpc.DialOption
@@ -115,6 +106,26 @@ func (s *space) Upload(ctx context.Context, info *UploadRequest, buf *bufio.Read
 	}
 
 	return &UploadResponse{res}, nil
+}
+
+func (s *space) CopyFrom(ctx context.Context, req *CopyRequest) (*CopyResponse, error) {
+	res, err := s.client.CopyFrom(ctx, &pb.CopyFromReq{
+		Uri:     req.Uri,
+		Headers: req.Headers,
+		Key:     req.Key,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &CopyResponse{res}, nil
+}
+
+func (s *space) Drop(ctx context.Context, key string) (err error) {
+	_, err = s.client.Drop(ctx, &pb.DropReq{
+		Key: key,
+	})
+	return
 }
 
 func (s *space) Close() error {

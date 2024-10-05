@@ -1,9 +1,10 @@
 package apophis
 
 import (
+	"errors"
 	"time"
 
-	"github.com/ninesbr/sheeps.toolkit.go/apophis/pb"
+	"github.com/ninesbr/sheeps.toolkit.go/apophis.queue/pb"
 )
 
 type options struct {
@@ -117,14 +118,15 @@ func (o *options) GetPubRequest() *pb.PubRequest {
 	}
 }
 
-func (o *options) Validate() ([]string, bool) {
-	var errs []string
+func (o *options) Validate() (err error) {
 	if o.host == "" {
-		errs = append(errs, "host is empty")
+		err = errors.Join(err, errors.New("host is empty"))
 	}
 	if o.port == 0 {
-		errs = append(errs, "port is empty")
+		err = errors.Join(err, errors.New("port is empty"))
 	}
-
-	return errs, len(errs) == 0
+	if o.queueName == "" {
+		err = errors.Join(err, errors.New("queue name is empty"))
+	}
+	return
 }

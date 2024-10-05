@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ninesbr/sheeps.toolkit.go/apophis/pb"
+	"github.com/ninesbr/sheeps.toolkit.go/apophis.queue/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -15,10 +15,10 @@ import (
 
 type ApophisInterface interface {
 	Ping() error
-	Publish(ctx context.Context, msg *MessageRequest) error
-	subscribe(ctx context.Context) (<-chan *MessageResponse, context.CancelFunc)
-	CreateFromOpts(ctx context.Context) error
-	Create(ctx context.Context, req *QueueCreateRequest) error
+	publish(msg *MessageRequest) error
+	subscribe(ctx context.Context) (<-chan *MessageResponse[any], context.CancelFunc)
+	Drop(keepMessagesRead bool) error
+	Create() error
 	Close() error
 }
 
@@ -29,8 +29,8 @@ type apophis struct {
 }
 
 func New(ops *options) ApophisInterface {
-	if errs, ok := ops.Validate(); !ok {
-		panic(errs)
+	if err := ops.Validate(); err != nil {
+		panic(err)
 	}
 
 	var opts []grpc.DialOption
@@ -57,32 +57,35 @@ func (a *apophis) Ping() (err error) {
 	return
 }
 
-func (a *apophis) Create(ctx context.Context, req *QueueCreateRequest) error {
-	_, err := a.client.Create(ctx, req.PubRequest)
+func (a *apophis) Create() error {
+	_, err := a.client.Create(context.Background(), a.ops.GetPubRequest())
 	return err
 }
 
-func (a *apophis) CreateFromOpts(ctx context.Context) error {
-	_, err := a.client.Create(ctx, a.ops.GetPubRequest())
+func (a *apophis) Drop(keepMessagesRead bool) error {
+	_, err := a.client.Drop(context.Background(), &pb.DropRequest{
+		Uniqid:           a.ops.queueName,
+		KeepMessagesRead: keepMessagesRead,
+	})
 	return err
 }
 
-func (a *apophis) Publish(ctx context.Context, msg *MessageRequest) (err error) {
-
-	if msg.Uniqid == "" {
-		msg.Uniqid = a.ops.queueName
-	} 
-
-	_, err = a.client.Publish(ctx, msg.PubMessageRequest)
-	if err != nil {
-		fmt.Println("client.Publish err:")
-	}
+func (a *apophis) publish(msg *MessageRequest) (err error) {
+	_, err = a.client.Publish(context.Background(), &pb.PubMessageRequest{
+		ContentType: msg.ContentType,
+		Uniqid:      a.ops.queueName,
+		Headers:     msg.Headers,
+		Body:        msg.Body,
+		Tags:        msg.Tags,
+		CustomID:    msg.CustomID,
+		TrackingID:  msg.TrackingID,
+	})
 	return
 }
 
-func (a *apophis) subscribe(ctx context.Context) (<-chan *MessageResponse, context.CancelFunc) {
+func (a *apophis) subscribe(ctx context.Context) (<-chan *MessageResponse[any], context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
-	response := make(chan *MessageResponse)
+	response := make(chan *MessageResponse[any])
 	go func() {
 		defer func() {
 			close(response)
@@ -103,7 +106,7 @@ func (a *apophis) subscribe(ctx context.Context) (<-chan *MessageResponse, conte
 	return response, cancel
 }
 
-func (a *apophis) read_messages(stream grpc.BidiStreamingClient[pb.SubscribeMessage, pb.SubscribeMessage], topic chan<- *MessageResponse, errCh chan<- error) {
+func (a *apophis) read_messages(stream grpc.BidiStreamingClient[pb.SubscribeMessage, pb.SubscribeMessage], topic chan<- *MessageResponse[any], errCh chan<- error) {
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
@@ -111,7 +114,10 @@ func (a *apophis) read_messages(stream grpc.BidiStreamingClient[pb.SubscribeMess
 			break
 		}
 
-		out := &MessageResponse{SubscribeMessage: msg}
+		out := &MessageResponse[any]{
+			header: msg.Headers,
+			body:   msg.Body,
+		}
 
 		autoCommit := time.AfterFunc(a.ops.autoCommitTime, func() {
 			msg.Commit = pb.MessageCommit_DISCARD
@@ -130,7 +136,19 @@ func (a *apophis) read_messages(stream grpc.BidiStreamingClient[pb.SubscribeMess
 			stream.Send(msg)
 		}
 
-		out.Ignore = func() {
+		out.RetryWithHeader = func(header map[string]string) {
+			autoCommit.Stop()
+			msg.Commit = pb.MessageCommit_RETRY
+			if msg.Headers == nil {
+				msg.Headers = make(map[string]string)
+			}
+			for k, v := range header {
+				msg.Headers[k] = v
+			}
+			stream.Send(msg)
+		}
+
+		out.Discard = func() {
 			autoCommit.Stop()
 			msg.Commit = pb.MessageCommit_DISCARD
 			stream.Send(msg)
@@ -140,7 +158,7 @@ func (a *apophis) read_messages(stream grpc.BidiStreamingClient[pb.SubscribeMess
 	}
 }
 
-func (a *apophis) watching(ctx context.Context, topic chan *MessageResponse) error {
+func (a *apophis) watching(ctx context.Context, topic chan *MessageResponse[any]) error {
 	if err := a.Ping(); err != nil {
 		return err
 	}
@@ -160,7 +178,7 @@ func (a *apophis) watching(ctx context.Context, topic chan *MessageResponse) err
 		return err
 	}
 
-	forward := make(chan *MessageResponse)
+	forward := make(chan *MessageResponse[any])
 	errCh := make(chan error, 1)
 	defer close(forward)
 	go a.read_messages(res, forward, errCh)

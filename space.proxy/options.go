@@ -1,5 +1,7 @@
 package spaceproxy
 
+import "errors"
+
 type options struct {
 	host             string
 	port             int
@@ -8,7 +10,7 @@ type options struct {
 	uploadConcurrent int
 }
 
-func Options(ops ...func(*options)) *options {
+func NewOptions(ops ...func(*options)) *options {
 	svr := &options{
 		chunkSize:        2 * 1024 * 1024, // 2MB
 		uploadConcurrent: 1,
@@ -50,16 +52,18 @@ func WithUploadConcurrent(uploadConcurrent int) func(*options) {
 	}
 }
 
-func (o *options) Validate() ([]string, bool) {
-	var errs []string
+func (o *options) Validate() (err error) {
 	if o.host == "" {
-		errs = append(errs, "host is empty")
+		err = errors.Join(err, errors.New("host is empty"))
 	}
+
 	if o.port == 0 {
-		errs = append(errs, "port is empty")
+		err = errors.Join(err, errors.New("port is empty"))
 	}
+
 	if o.chunkSize == 0 {
-		errs = append(errs, "chunkSize is empty")
+		err = errors.Join(err, errors.New("chunkSize is empty"))
 	}
-	return errs, len(errs) == 0
+
+	return
 }
