@@ -36,7 +36,7 @@ func New(ops *options) ApophisInterface {
 	}
 
 	var opts []grpc.DialOption
-	if ops.insecured {
+	if ops.insecure {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(nil)))
@@ -55,21 +55,34 @@ func New(ops *options) ApophisInterface {
 }
 
 func (a *apophis) Ping() (err error) {
-	_, err = a.client.Ping(context.Background(), &pb.PingRequest{})
+	ctx, cancel := a.requestContext(context.Background())
+	defer cancel()
+
+	_, err = a.client.Ping(ctx, &pb.PingRequest{})
 	return
 }
 
 func (a *apophis) Create() error {
-	_, err := a.client.Create(context.Background(), a.ops.GetPubRequest())
+	ctx, cancel := a.requestContext(context.Background())
+	defer cancel()
+
+	_, err := a.client.Create(ctx, a.ops.GetPubRequest())
 	return err
 }
 
 func (a *apophis) Drop(keepMessagesRead bool) error {
-	_, err := a.client.Drop(context.Background(), &pb.DropRequest{
+	ctx, cancel := a.requestContext(context.Background())
+	defer cancel()
+
+	_, err := a.client.Drop(ctx, &pb.DropRequest{
 		Uniqid:           a.ops.queueName,
 		KeepMessagesRead: keepMessagesRead,
 	})
 	return err
+}
+
+func (a *apophis) requestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, a.ops.requestTimeout)
 }
 
 func (a *apophis) publish(msg *MessageRequest) (err error) {
@@ -227,7 +240,10 @@ func (a *apophis) watching(ctx context.Context, topic chan *MessageResponse[any]
 
 	// O mesmo contexto controla desde o teste de conexão até o Recv do stream.
 	// Assim, cancelar a assinatura libera também os recursos internos do gRPC.
-	if _, err := a.client.Ping(streamCtx, &pb.PingRequest{}); err != nil {
+	pingCtx, cancelPing := a.requestContext(streamCtx)
+	_, err := a.client.Ping(pingCtx, &pb.PingRequest{})
+	cancelPing()
+	if err != nil {
 		return err
 	}
 	res, err := a.client.Subscribe(streamCtx)
@@ -240,7 +256,7 @@ func (a *apophis) watching(ctx context.Context, topic chan *MessageResponse[any]
 	err = sender.Send(&pb.SubscribeMessage{
 		Sign: &pb.SubscribeRequest{
 			Uniqid:      a.ops.queueName,
-			Parallelism: int32(a.ops.consumerParralelism),
+			Parallelism: int32(a.ops.consumerParallelism),
 		},
 	})
 
