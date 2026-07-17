@@ -2,7 +2,9 @@ package apophis
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/ninesbr/sheeps.toolkit.go/apophis.queue/pb"
@@ -71,7 +73,16 @@ func (a *apophis) Drop(keepMessagesRead bool) error {
 }
 
 func (a *apophis) publish(msg *MessageRequest) (err error) {
-	_, err = a.client.Publish(context.Background(), &pb.PubMessageRequest{
+	if msg == nil {
+		return errors.New("message request is nil")
+	}
+
+	// ApophisInterface não recebe context no Publish. Aplicamos o timeout aqui
+	// para que uma chamada unary nunca aguarde indefinidamente pelo servidor.
+	ctx, cancel := context.WithTimeout(context.Background(), a.ops.publishTimeout)
+	defer cancel()
+
+	req := &pb.PubMessageRequest{
 		ContentType: msg.ContentType,
 		Uniqid:      a.ops.queueName,
 		Headers:     msg.Headers,
@@ -79,7 +90,14 @@ func (a *apophis) publish(msg *MessageRequest) (err error) {
 		Tags:        msg.Tags,
 		CustomID:    msg.CustomID,
 		TrackingID:  msg.TrackingID,
-	})
+	}
+	if msg.ForceCreate {
+		// ForceCreate é propositalmente opt-in para não mudar a política de
+		// criação de filas dos publishers existentes.
+		req.ForceCreate = a.ops.GetPubRequest()
+	}
+
+	_, err = a.client.Publish(ctx, req)
 	return
 }
 
@@ -87,31 +105,83 @@ func (a *apophis) subscribe(ctx context.Context) (<-chan *MessageResponse[any], 
 	ctx, cancel := context.WithCancel(ctx)
 	response := make(chan *MessageResponse[any])
 	go func() {
-		defer func() {
-			close(response)
-		}()
+		defer close(response)
+
 		for {
 			err := a.watching(ctx, response)
-			if err != nil {
-				fmt.Println("watching err:", err)
-				fmt.Println("watching error status: ", status.Code(err))
-				if status.Code(err) != codes.Unknown {
-					time.Sleep(a.ops.reconnectInterval)
-				} else {
-					break
+
+			// O cancelamento solicitado pelo consumidor sempre vence qualquer
+			// política de reconexão.
+			if ctx.Err() != nil {
+				return
+			}
+			if !shouldReconnect(err) {
+				if err != nil {
+					fmt.Println("watching stopped:", err)
 				}
+				return
+			}
+
+			fmt.Println("watching reconnecting after error:", err)
+			if !waitForReconnect(ctx, a.ops.reconnectInterval) {
+				return
 			}
 		}
 	}()
 	return response, cancel
 }
 
-func (a *apophis) read_messages(stream grpc.BidiStreamingClient[pb.SubscribeMessage, pb.SubscribeMessage], topic chan<- *MessageResponse[any], errCh chan<- error) {
+func shouldReconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Erros puros de context não são necessariamente convertidos em status
+	// pelo gRPC e poderiam aparecer como Unknown.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// Recv retorna EOF quando o servidor encerra o stream com status OK. Para
+	// um consumidor contínuo, isso significa abrir uma nova assinatura.
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+
+	switch status.Code(err) {
+	case codes.Unavailable,
+		codes.ResourceExhausted,
+		codes.Aborted,
+		codes.Internal,
+		codes.Unknown,
+		codes.DeadlineExceeded:
+		return true
+	default:
+		// Canceled, InvalidArgument, NotFound, PermissionDenied,
+		// Unauthenticated e demais erros permanentes não entram em loop.
+		return false
+	}
+}
+
+func waitForReconnect(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (a *apophis) readMessages(ctx context.Context, stream grpc.BidiStreamingClient[pb.SubscribeMessage, pb.SubscribeMessage], sender *serializedStreamSender, topic chan<- *MessageResponse[any], errCh chan<- error) {
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
-			errCh <- err
-			break
+			select {
+			case errCh <- err:
+			case <-ctx.Done():
+			}
+			return
 		}
 
 		out := &MessageResponse[any]{
@@ -119,54 +189,55 @@ func (a *apophis) read_messages(stream grpc.BidiStreamingClient[pb.SubscribeMess
 			body:   msg.Body,
 		}
 
-		autoCommit := time.AfterFunc(a.ops.autoCommitTime, func() {
-			msg.Commit = pb.MessageCommit_DISCARD
-			stream.Send(msg)
-		})
+		confirmation := newDeliveryConfirmation(ctx, sender, msg, errCh)
 
 		out.OK = func() {
-			autoCommit.Stop()
-			msg.Commit = pb.MessageCommit_OK
-			stream.Send(msg)
+			confirmation.confirm(pb.MessageCommit_OK, nil)
 		}
 
 		out.Retry = func() {
-			autoCommit.Stop()
-			msg.Commit = pb.MessageCommit_RETRY
-			stream.Send(msg)
+			confirmation.confirm(pb.MessageCommit_RETRY, nil)
 		}
 
 		out.RetryWithHeader = func(header map[string]string) {
-			autoCommit.Stop()
-			msg.Commit = pb.MessageCommit_RETRY
-			if msg.Headers == nil {
-				msg.Headers = make(map[string]string)
-			}
-			for k, v := range header {
-				msg.Headers[k] = v
-			}
-			stream.Send(msg)
+			confirmation.confirm(pb.MessageCommit_RETRY, header)
 		}
 
 		out.Discard = func() {
-			autoCommit.Stop()
-			msg.Commit = pb.MessageCommit_DISCARD
-			stream.Send(msg)
+			confirmation.confirm(pb.MessageCommit_DISCARD, nil)
 		}
 
-		topic <- out
+		// A entrega também precisa respeitar o cancelamento. Sem este select, um
+		// consumidor lento poderia manter a goroutine presa mesmo após Stop/Close.
+		select {
+		case topic <- out:
+			// O prazo começa após o handoff; tempo bloqueado aguardando o
+			// consumidor não deve contar como tempo de processamento.
+			confirmation.startTimeout(a.ops.autoCommitTime)
+		case <-ctx.Done():
+			confirmation.cancel()
+			return
+		}
 	}
 }
 
 func (a *apophis) watching(ctx context.Context, topic chan *MessageResponse[any]) error {
-	if err := a.Ping(); err != nil {
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	// O mesmo contexto controla desde o teste de conexão até o Recv do stream.
+	// Assim, cancelar a assinatura libera também os recursos internos do gRPC.
+	if _, err := a.client.Ping(streamCtx, &pb.PingRequest{}); err != nil {
 		return err
 	}
-	res, err := a.client.Subscribe(context.Background())
+	res, err := a.client.Subscribe(streamCtx)
 	if err != nil {
 		return err
 	}
-	err = res.Send(&pb.SubscribeMessage{
+
+	errCh := make(chan error, 1)
+	sender := &serializedStreamSender{stream: res}
+	err = sender.Send(&pb.SubscribeMessage{
 		Sign: &pb.SubscribeRequest{
 			Uniqid:      a.ops.queueName,
 			Parallelism: int32(a.ops.consumerParralelism),
@@ -178,24 +249,15 @@ func (a *apophis) watching(ctx context.Context, topic chan *MessageResponse[any]
 		return err
 	}
 
-	forward := make(chan *MessageResponse[any])
-	errCh := make(chan error, 1)
-	defer close(forward)
-	go a.read_messages(res, forward, errCh)
-	for {
-		select {
-		case <-ctx.Done():
-			_ = res.Send(&pb.SubscribeMessage{
-				UnSing: &pb.UnSubscribeRequest{
-					Uniqid: a.ops.queueName,
-				},
-			})
-			return fmt.Errorf("context canceled")
-		case err := <-errCh:
-			return err
-		case msg := <-forward:
-			topic <- msg
-		}
+	go a.readMessages(streamCtx, res, sender, topic, errCh)
+
+	select {
+	case <-ctx.Done():
+		// Não enviamos UnSing aqui: o contexto já encerra o stream inteiro e é a
+		// forma recomendada pelo gRPC de liberar Recv e recursos associados.
+		return ctx.Err()
+	case err := <-errCh:
+		return err
 	}
 }
 

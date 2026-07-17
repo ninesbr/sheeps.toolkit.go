@@ -25,6 +25,7 @@ type MessageRequest struct {
 	Tags        []string
 	CustomID    string
 	TrackingID  string
+	ForceCreate bool
 }
 
 type MessageRequestOptions struct {
@@ -33,6 +34,7 @@ type MessageRequestOptions struct {
 	Tags        []string
 	CustomID    string
 	TrackingID  string
+	ForceCreate bool
 }
 
 func (res *MessageResponse[T]) GetHeader(key string) string {
@@ -98,5 +100,13 @@ func WithTrackingIDRequest(trackingID string) func(*MessageRequestOptions) {
 func WithContentTypeRequest(contentType string) func(*MessageRequestOptions) {
 	return func(o *MessageRequestOptions) {
 		o.ContentType = contentType
+	}
+}
+
+// WithForceCreateRequest pede ao servidor que crie a fila durante o Publish
+// caso ela ainda não exista. A configuração vem das opções do cliente.
+func WithForceCreateRequest(forceCreate bool) func(*MessageRequestOptions) {
+	return func(o *MessageRequestOptions) {
+		o.ForceCreate = forceCreate
 	}
 }

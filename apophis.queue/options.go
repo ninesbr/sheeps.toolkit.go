@@ -11,6 +11,7 @@ type options struct {
 	host                string
 	port                int
 	insecured           bool
+	publishTimeout      time.Duration
 	reconnectInterval   time.Duration
 	autoCommitTime      time.Duration
 	consumerParralelism int
@@ -25,6 +26,7 @@ type options struct {
 
 func NewOptions(ops ...func(*options)) *options {
 	svr := &options{
+		publishTimeout:      10 * time.Second,
 		reconnectInterval:   10 * time.Second,
 		autoCommitTime:      5 * time.Second,
 		consumerParralelism: 1,
@@ -33,6 +35,14 @@ func NewOptions(ops ...func(*options)) *options {
 		o(svr)
 	}
 	return svr
+}
+
+// WithPublishTimeout limita uma chamada unary de Publish. O contexto não faz
+// parte de ApophisInterface, portanto o prazo é aplicado dentro do cliente.
+func WithPublishTimeout(timeout time.Duration) func(*options) {
+	return func(o *options) {
+		o.publishTimeout = timeout
+	}
 }
 
 func WithHost(host string) func(*options) {
@@ -127,6 +137,9 @@ func (o *options) Validate() (err error) {
 	}
 	if o.queueName == "" {
 		err = errors.Join(err, errors.New("queue name is empty"))
+	}
+	if o.publishTimeout <= 0 {
+		err = errors.Join(err, errors.New("publish timeout must be greater than zero"))
 	}
 	return
 }

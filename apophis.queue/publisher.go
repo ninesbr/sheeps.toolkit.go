@@ -1,6 +1,12 @@
 package apophis
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"mime"
+	"strings"
+)
 
 type Publisher[T any] struct {
 	cli ApophisInterface
@@ -13,41 +19,63 @@ func NewPublisher[T any](cli ApophisInterface) *Publisher[T] {
 }
 
 func (p *Publisher[T]) Publish(msg *T, opsFunc ...func(*MessageRequestOptions)) error {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return err
+	if p == nil || p.cli == nil {
+		return errors.New("publisher client is nil")
 	}
-
-	req := &MessageRequest{
-		ContentType: "application/json",
-		Body:        data,
+	if msg == nil {
+		// json.Marshal aceitaria este valor e publicaria o JSON `null`, o que
+		// normalmente representa uma mensagem inválida para o consumidor.
+		return errors.New("message is nil")
 	}
 
 	ops := &MessageRequestOptions{}
-	for _, op := range opsFunc {
+	for index, op := range opsFunc {
+		if op == nil {
+			return fmt.Errorf("message request option %d is nil", index)
+		}
 		op(ops)
 	}
 
+	contentType := "application/json"
 	if ops.ContentType != "" {
-		req.ContentType = ops.ContentType
+		if err := validateJSONContentType(ops.ContentType); err != nil {
+			return err
+		}
+		contentType = ops.ContentType
 	}
 
-    if ops.Headers != nil {
-		req.Headers = ops.Headers
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal publish message: %w", err)
 	}
 
-    if ops.Tags != nil {
-		req.Tags = ops.Tags
+	req := &MessageRequest{
+		ContentType: contentType,
+		Body:        data,
+		Headers:     ops.Headers,
+		Tags:        ops.Tags,
+		CustomID:    ops.CustomID,
+		TrackingID:  ops.TrackingID,
+		ForceCreate: ops.ForceCreate,
 	}
 
-    if ops.CustomID != "" {
-		req.CustomID = ops.CustomID
+	if err := p.cli.publish(req); err != nil {
+		return fmt.Errorf("publish message: %w", err)
 	}
-
-	if ops.TrackingID != "" {
-		req.TrackingID = ops.TrackingID
-	}
-
-	return p.cli.publish(req)
+	return nil
 }
 
+func validateJSONContentType(contentType string) error {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return fmt.Errorf("invalid content type %q: %w", contentType, err)
+	}
+
+	mediaType = strings.ToLower(mediaType)
+	if mediaType != "application/json" && !strings.HasSuffix(mediaType, "+json") {
+		// Este publisher não recebe bytes prontos: seu corpo sempre vem de
+		// json.Marshal e não pode ser anunciado como protobuf, texto etc.
+		return fmt.Errorf("content type %q is not compatible with JSON", contentType)
+	}
+	return nil
+}
